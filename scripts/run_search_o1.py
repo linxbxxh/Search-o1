@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 from bing_search import (
-    bing_web_search, 
+    web_search, 
     extract_relevant_info, 
     fetch_page_content, 
     extract_snippet_with_context
@@ -163,8 +163,9 @@ def parse_args():
     parser.add_argument(
         '--bing_subscription_key',
         type=str,
-        required=True,
-        help="Bing Search API subscription key."
+        required=False,
+        default='None',
+        help="Bing Search API subscription key (only required when --search_provider bing)."
     )
 
     parser.add_argument(
@@ -173,6 +174,10 @@ def parse_args():
         default="https://api.bing.microsoft.com/v7.0/search",
         help="Bing Search API endpoint."
     )
+
+    parser.add_argument('--search_provider', type=str, default='ddgs', choices=['ddgs', 'google', 'bing'], help='Search provider backend.')
+    parser.add_argument('--google_api_key', type=str, default='None', help='Google Custom Search API key.')
+    parser.add_argument('--google_cse_id', type=str, default='None', help='Google Custom Search Engine ID (cx).')
 
     parser.add_argument('--enable_planner', action='store_true', help='Enable planner stage.')
     parser.add_argument('--enable_critic', action='store_true', help='Enable iterative critic stage.')
@@ -203,8 +208,11 @@ def main():
     top_k_sampling = args.top_k_sampling
     repetition_penalty = args.repetition_penalty
     max_tokens = args.max_tokens
-    bing_subscription_key = args.bing_subscription_key
+    bing_subscription_key = None if args.bing_subscription_key == 'None' else args.bing_subscription_key
     bing_endpoint = args.bing_endpoint
+    search_provider = args.search_provider
+    google_api_key = None if args.google_api_key == "None" else args.google_api_key
+    google_cse_id = None if args.google_cse_id == "None" else args.google_cse_id
     use_jina = args.use_jina
     jina_api_key = args.jina_api_key
     enable_planner = args.enable_planner
@@ -423,7 +431,7 @@ def main():
                 results = search_cache.get(query)
                 if results is None:
                     try:
-                        results = bing_web_search(query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
+                        results = web_search(query, provider=search_provider, subscription_key=bing_subscription_key, endpoint=bing_endpoint, market='en-US', language='en', max_results=top_k, google_api_key=google_api_key, google_cse_id=google_cse_id)
                     except Exception:
                         results = {}
                     search_cache[query] = results
@@ -594,7 +602,7 @@ def main():
                             print(f"Using cached search results for query: \"{search_query}\"")
                         else:
                             try:
-                                results = bing_web_search(search_query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
+                                results = web_search(search_query, provider=search_provider, subscription_key=bing_subscription_key, endpoint=bing_endpoint, market='en-US', language='en', max_results=top_k, google_api_key=google_api_key, google_cse_id=google_cse_id)
                                 search_cache[search_query] = results
                                 print(f"Executed and cached search for query: \"{search_query}\"")
                             except Exception as e:
