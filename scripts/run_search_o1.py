@@ -35,6 +35,9 @@ from prompts import (
     get_task_instruction_multi_choice, 
     get_task_instruction_code, 
 )
+from planner import build_planner_output, planner_to_context_block
+from critic import evaluate_candidate, critic_to_context_block, should_run_critic
+from voting import build_voting_payload, voting_to_context_block
 
 # Define special tokens
 BEGIN_SEARCH_QUERY = "<|begin_search_query|>"
@@ -171,6 +174,16 @@ def parse_args():
         help="Bing Search API endpoint."
     )
 
+    parser.add_argument('--enable_planner', action='store_true', help='Enable planner stage.')
+    parser.add_argument('--enable_critic', action='store_true', help='Enable iterative critic stage.')
+    parser.add_argument('--enable_voting', action='store_true', help='Enable self-consistency voting stage.')
+    parser.add_argument('--k_votes', type=int, default=5, help='Number of candidates for voting, range [1, 15].')
+    parser.add_argument('--max_refine_iters', type=int, default=2, help='Maximum critic refine iterations, range [0, 5].')
+    parser.add_argument('--context_budget_tokens', type=int, default=256, help='Per-stage context injection budget.')
+    parser.add_argument('--vote_mode', type=str, default='majority', choices=['majority', 'evidence_weighted'])
+    parser.add_argument('--critic_score_threshold', type=float, default=0.65, help='Score threshold for critic gating.')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility.')
+
     return parser.parse_args()
 
 def main():
@@ -194,6 +207,18 @@ def main():
     bing_endpoint = args.bing_endpoint
     use_jina = args.use_jina
     jina_api_key = args.jina_api_key
+    enable_planner = args.enable_planner
+    enable_critic = args.enable_critic
+    enable_voting = args.enable_voting
+    k_votes = max(1, min(15, args.k_votes))
+    max_refine_iters = max(0, min(5, args.max_refine_iters))
+    context_budget_tokens = args.context_budget_tokens
+    vote_mode = args.vote_mode
+    critic_score_threshold = args.critic_score_threshold
+    seed = args.seed
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     
     # Adjust parameters based on dataset
     if dataset_name in ['nq', 'triviaqa', 'hotpotqa', 'musique', 'bamboogle', '2wiki', 'medmcqa', 'pubhealth']:
@@ -270,6 +295,11 @@ def main():
         model_short_name = model_path.split('/')[-1].lower().replace('-instruct', '')
         output_dir = f'./outputs/runs.baselines/{dataset_name}.{model_short_name}.search_o1'
     os.makedirs(output_dir, exist_ok=True)
+    stage_log_path = os.path.join(output_dir, f"{split}.stage_logs.jsonl")
+
+    def log_stage(record: Dict):
+        with open(stage_log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # Initialize the LLM
     llm = LLM(
@@ -382,7 +412,33 @@ def main():
         'history': [],
         'search_count': 0,
         'executed_search_queries': set(),
+        'planner_json': None,
     } for item, prompt in zip(filtered_data, input_list)]
+
+    if enable_planner:
+        for seq in active_sequences:
+            question = seq['item']['Question']
+
+            def planner_search(query: str):
+                results = search_cache.get(query)
+                if results is None:
+                    try:
+                        results = bing_web_search(query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
+                    except Exception:
+                        results = {}
+                    search_cache[query] = results
+                return extract_relevant_info(results)[:max(1, min(3, top_k))]
+
+            planner_json = build_planner_output(
+                question=question,
+                search_fn=planner_search,
+                context_budget_tokens=context_budget_tokens,
+            )
+            planner_block, planner_payload = planner_to_context_block(planner_json, context_budget_tokens=context_budget_tokens)
+            seq['prompt'] += planner_block
+            seq['output'] += planner_block
+            seq['planner_json'] = planner_payload
+            log_stage({"stage": "planner", "question": question, "planner": planner_payload})
 
     # ---------------------- Set Max Tokens ----------------------
     if 'qwq' in model_path.lower():
@@ -404,6 +460,7 @@ def main():
             repetition_penalty=repetition_penalty,
             stop=[END_SEARCH_QUERY, tokenizer.eos_token],
             include_stop_str_in_output=True,
+            seed=seed,
         )
         output_list = llm.generate(prompts, sampling_params=sampling_params)
         return output_list
@@ -699,6 +756,68 @@ def main():
 
     # Prepare output list for evaluation
     output_list = [seq['output'] for seq in active_sequences]
+
+    if enable_critic:
+        for seq in active_sequences:
+            if not should_run_critic(seq['output'], enabled=True):
+                continue
+            for it in range(max_refine_iters):
+                critic_json = evaluate_candidate(seq['output'], min_score_to_pass=critic_score_threshold)
+                log_stage({"stage": "critic", "iteration": it, "question": seq['item']['Question'], "critic": critic_json})
+                if not critic_json['revise_required']:
+                    break
+                critic_block, payload = critic_to_context_block(critic_json, budget_tokens=context_budget_tokens)
+                seq['prompt'] += critic_block
+                refine_output = llm.generate(
+                    [seq['prompt']],
+                    sampling_params=SamplingParams(
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k_sampling,
+                        repetition_penalty=repetition_penalty,
+                        stop=[tokenizer.eos_token],
+                        include_stop_str_in_output=True,
+                        seed=seed + it + 1,
+                    )
+                )[0].outputs[0].text
+                seq['prompt'] += refine_output
+                seq['output'] += "\n" + refine_output
+                seq['history'].append({"critic": payload, "refined_output": refine_output})
+
+    if enable_voting:
+        voted_outputs = []
+        for seq_idx, seq in enumerate(active_sequences):
+            base_prompt = seq['prompt']
+            prompts = [base_prompt for _ in range(k_votes)]
+            sampled = llm.generate(
+                prompts,
+                sampling_params=SamplingParams(
+                    max_tokens=max_tokens,
+                    temperature=max(temperature, 0.8),
+                    top_p=top_p,
+                    top_k=top_k_sampling,
+                    repetition_penalty=repetition_penalty,
+                    stop=[tokenizer.eos_token],
+                    include_stop_str_in_output=True,
+                    seed=seed + seq_idx * 100,
+                )
+            )
+            raw_answers = [o.outputs[0].text for o in sampled]
+            evidence_stats = []
+            for ans in raw_answers:
+                cj = evaluate_candidate(ans, min_score_to_pass=critic_score_threshold)
+                evidence_stats.append({
+                    "coverage": 1.0 if "<|begin_search_result|>" in ans else 0.0,
+                    "critic_pass": 1.0 if not cj['revise_required'] else 0.0,
+                })
+            voting_json = build_voting_payload(raw_answers, evidence_stats=evidence_stats, mode=vote_mode)
+            seq['output'] += voting_to_context_block(voting_json, budget_tokens=context_budget_tokens)
+            winner = voting_json['vote']['winner']
+            winner_raw = next((c['raw_answer'] for c in voting_json['candidates'] if c['answer_norm'] == winner), raw_answers[0])
+            voted_outputs.append(winner_raw)
+            log_stage({"stage": "voting", "question": seq['item']['Question'], "voting": voting_json})
+        output_list = voted_outputs
 
     # Run evaluation
     run_evaluation(filtered_data, input_list, output_list, dataset_name, output_dir, total_time, split)
