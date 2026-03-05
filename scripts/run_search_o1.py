@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 from bing_search import (
-    bing_web_search, 
+    web_search, 
     extract_relevant_info, 
     fetch_page_content, 
     extract_snippet_with_context
@@ -35,6 +35,10 @@ from prompts import (
     get_task_instruction_multi_choice, 
     get_task_instruction_code, 
 )
+from planner import build_planner_output, planner_to_context_block
+from critic import evaluate_candidate, critic_to_context_block, should_run_critic
+from voting import build_voting_payload, voting_to_context_block
+from orchestrator import Orchestrator
 
 # Define special tokens
 BEGIN_SEARCH_QUERY = "<|begin_search_query|>"
@@ -160,8 +164,9 @@ def parse_args():
     parser.add_argument(
         '--bing_subscription_key',
         type=str,
-        required=True,
-        help="Bing Search API subscription key."
+        required=False,
+        default='None',
+        help="Bing Search API subscription key (only required when --search_provider bing)."
     )
 
     parser.add_argument(
@@ -170,6 +175,36 @@ def parse_args():
         default="https://api.bing.microsoft.com/v7.0/search",
         help="Bing Search API endpoint."
     )
+
+    parser.add_argument('--search_provider', type=str, default='ddgs', choices=['ddgs', 'google', 'bing'], help='Search provider backend.')
+    parser.add_argument('--google_api_key', type=str, default='None', help='Google Custom Search API key.')
+    parser.add_argument('--google_cse_id', type=str, default='None', help='Google Custom Search Engine ID (cx).')
+
+    parser.add_argument('--enable_planner', action='store_true', help='Enable planner stage.')
+    parser.add_argument('--enable_critic', action='store_true', help='Enable iterative critic stage.')
+    parser.add_argument('--enable_voting', action='store_true', help='Enable self-consistency voting stage.')
+    parser.add_argument('--k_votes', type=int, default=5, help='Number of candidates for voting, range [1, 15].')
+    parser.add_argument('--max_refine_iters', type=int, default=2, help='Maximum critic refine iterations, range [0, 5].')
+    parser.add_argument('--context_budget_tokens', type=int, default=256, help='Per-stage context injection budget.')
+    parser.add_argument('--vote_mode', type=str, default='majority', choices=['majority', 'evidence_weighted'])
+    parser.add_argument('--critic_score_threshold', type=float, default=0.65, help='Score threshold for critic gating.')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility.')
+
+    parser.add_argument('--enable_sc', action='store_true', help='Enable self-consistency voting.')
+    parser.add_argument('--sc_n', type=int, default=3, help='Number of self-consistency samples.')
+    parser.add_argument('--sc_vote_mode', type=str, default='evidence_constrained', choices=['majority', 'evidence_constrained'])
+    parser.add_argument('--sc_share_retrieval', type=bool, default=True, help='Share retrieval evidence across SC samples.')
+
+    parser.add_argument('--planner_pre_retrieve', type=bool, default=False, help='Planner performs pre-retrieval for evidence brief.')
+    parser.add_argument('--max_plan_queries', type=int, default=3, help='Maximum planner queries.')
+    parser.add_argument('--plan_summary_max_chars', type=int, default=1200, help='Max chars for injected plan summary.')
+
+    parser.add_argument('--critic_mode', type=str, default='event', choices=['event', 'every_turn'])
+    parser.add_argument('--critic_max_chars', type=int, default=400)
+    parser.add_argument('--critic_min_context_chars', type=int, default=1200)
+
+    parser.add_argument('--max_injected_chars', type=int, default=1800, help='Max chars for each injected external block.')
+    parser.add_argument('--blocklist_patterns', type=str, default='ignore previous,reveal key,system prompt')
 
     return parser.parse_args()
 
@@ -190,10 +225,26 @@ def main():
     top_k_sampling = args.top_k_sampling
     repetition_penalty = args.repetition_penalty
     max_tokens = args.max_tokens
-    bing_subscription_key = args.bing_subscription_key
+    bing_subscription_key = None if args.bing_subscription_key == 'None' else args.bing_subscription_key
     bing_endpoint = args.bing_endpoint
+    search_provider = args.search_provider
+    google_api_key = None if args.google_api_key == "None" else args.google_api_key
+    google_cse_id = None if args.google_cse_id == "None" else args.google_cse_id
     use_jina = args.use_jina
     jina_api_key = args.jina_api_key
+    enable_planner = args.enable_planner
+    enable_critic = args.enable_critic
+    enable_voting = args.enable_voting
+    enable_sc = args.enable_sc or enable_voting
+    k_votes = max(1, min(15, args.k_votes))
+    max_refine_iters = max(0, min(5, args.max_refine_iters))
+    context_budget_tokens = args.context_budget_tokens
+    vote_mode = args.vote_mode
+    critic_score_threshold = args.critic_score_threshold
+    seed = args.seed
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     
     # Adjust parameters based on dataset
     if dataset_name in ['nq', 'triviaqa', 'hotpotqa', 'musique', 'bamboogle', '2wiki', 'medmcqa', 'pubhealth']:
@@ -270,6 +321,13 @@ def main():
         model_short_name = model_path.split('/')[-1].lower().replace('-instruct', '')
         output_dir = f'./outputs/runs.baselines/{dataset_name}.{model_short_name}.search_o1'
     os.makedirs(output_dir, exist_ok=True)
+    stage_log_path = os.path.join(output_dir, f"{split}.stage_logs.jsonl")
+
+    def log_stage(record: Dict):
+        with open(stage_log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    orchestrator = Orchestrator(args=args, llm=None, tokenizer=tokenizer, sampling_params_cls=SamplingParams, log_fn=log_stage)
 
     # Initialize the LLM
     llm = LLM(
@@ -277,6 +335,7 @@ def main():
         tensor_parallel_size=torch.cuda.device_count(),
         gpu_memory_utilization=0.95,
     )
+    orchestrator.llm = llm
 
     # ---------------------- Data Loading ----------------------
     with open(data_path, 'r', encoding='utf-8') as json_file:
@@ -325,6 +384,34 @@ def main():
         return extracted_infos
 
     # ---------------------- Preparation of Input Prompts ----------------------
+
+    # Hook A (Planner): before constructing prompt/input_list
+    planner_blocks = {}
+    if args.enable_planner:
+        def _search_for_planner(query: str):
+            results = search_cache.get(query)
+            if results is None:
+                results = web_search(
+                    query,
+                    provider=search_provider,
+                    subscription_key=bing_subscription_key,
+                    endpoint=bing_endpoint,
+                    market='en-US',
+                    language='en',
+                    max_results=top_k,
+                    google_api_key=google_api_key,
+                    google_cse_id=google_cse_id,
+                )
+                search_cache[query] = results
+            return extract_relevant_info(results)
+
+        for item in filtered_data:
+            q = item['Question']
+            try:
+                planner_blocks[q] = orchestrator.planner_block_for_question(q, _search_for_planner)
+            except Exception:
+                planner_blocks[q] = ''
+
     input_list = []
     for item in filtered_data:
         question = item['Question']
@@ -365,7 +452,8 @@ def main():
         else:
             user_prompt = ""  # Default to empty if dataset not matched
 
-        prompt = [{"role": "user", "content": instruction + user_prompt}]
+        planner_block = planner_blocks.get(question, '')
+        prompt = [{"role": "user", "content": instruction + user_prompt + planner_block}]
         prompt = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
         input_list.append(prompt)
 
@@ -382,7 +470,9 @@ def main():
         'history': [],
         'search_count': 0,
         'executed_search_queries': set(),
+        'planner_json': None,
     } for item, prompt in zip(filtered_data, input_list)]
+    # Planner handled by Hook A orchestrator
 
     # ---------------------- Set Max Tokens ----------------------
     if 'qwq' in model_path.lower():
@@ -404,17 +494,14 @@ def main():
             repetition_penalty=repetition_penalty,
             stop=[END_SEARCH_QUERY, tokenizer.eos_token],
             include_stop_str_in_output=True,
+            seed=seed,
         )
         output_list = llm.generate(prompts, sampling_params=sampling_params)
         return output_list
 
     # Function to extract text between two tags
     def extract_between(text: str, start_tag: str, end_tag: str) -> Optional[str]:
-        pattern = re.escape(start_tag) + r"(.*?)" + re.escape(end_tag)
-        matches = re.findall(pattern, text, flags=re.DOTALL)
-        if matches:
-            return matches[-1].strip()
-        return None
+        return orchestrator.extract_between(text, start_tag, end_tag)
 
     def replace_recent_steps(origin_str, replace_str):
         """
@@ -537,7 +624,7 @@ def main():
                             print(f"Using cached search results for query: \"{search_query}\"")
                         else:
                             try:
-                                results = bing_web_search(search_query, bing_subscription_key, bing_endpoint, market='en-US', language='en')
+                                results = web_search(search_query, provider=search_provider, subscription_key=bing_subscription_key, endpoint=bing_endpoint, market='en-US', language='en', max_results=top_k, google_api_key=google_api_key, google_cse_id=google_cse_id)
                                 search_cache[search_query] = results
                                 print(f"Executed and cached search for query: \"{search_query}\"")
                             except Exception as e:
@@ -665,7 +752,8 @@ def main():
 
                 for seq, analysis in zip(batch_sequences, webpage_analyses):
                     if isinstance(analysis, str):
-                        append_text = f"\n\n{BEGIN_SEARCH_RESULT}{analysis}{END_SEARCH_RESULT}\n\n"
+                        append_text = orchestrator.normalize_and_wrap_evidence(analysis, meta={'query': seq.get('history', [])[-1] if seq.get('history') else ''})
+                        seq['last_evidence_summary'] = orchestrator.sanitize_external_text(analysis, max_chars=args.max_injected_chars)
                         seq['prompt'] += append_text
                         seq['output'] += append_text
                         seq['history'].append(append_text)
@@ -674,6 +762,22 @@ def main():
                         seq['prompt'] += append_text
                         seq['output'] += append_text
                         seq['history'].append(append_text)
+
+
+            # Hook B (Critic): after generation and evidence injection, before next turn
+            for seq in sequences_needing_generation:
+                try:
+                    orchestrator.maybe_apply_critic(
+                        seq=seq,
+                        turn=turn,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k_sampling=top_k_sampling,
+                        repetition_penalty=repetition_penalty,
+                    )
+                except Exception as e:
+                    log_stage({'stage': 'critic', 'turn': turn, 'error': str(e)})
 
         # Check if all sequences are finished
         unfinished = [seq for seq in active_sequences if not seq['finished']]
@@ -699,6 +803,22 @@ def main():
 
     # Prepare output list for evaluation
     output_list = [seq['output'] for seq in active_sequences]
+    # Hook C (Vote): before final output/evaluation
+    if enable_sc:
+        sc_outputs = []
+        for seq in active_sequences:
+            try:
+                sc_outputs.append(orchestrator.self_consistency_vote(
+                    seq=seq,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k_sampling=top_k_sampling,
+                    repetition_penalty=repetition_penalty,
+                ))
+            except Exception:
+                sc_outputs.append(seq.get('output', ''))
+        output_list = sc_outputs
 
     # Run evaluation
     run_evaluation(filtered_data, input_list, output_list, dataset_name, output_dir, total_time, split)
