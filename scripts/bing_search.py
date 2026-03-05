@@ -11,7 +11,7 @@ import pdfplumber
 from io import BytesIO
 import re
 import string
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 from nltk.tokenize import sent_tokenize
 
 
@@ -181,6 +181,93 @@ def fetch_page_content(urls, max_workers=32, use_jina=False, jina_api_key=None, 
     return results
 
 
+
+
+def ddgs_web_search(query: str, max_results: int = 10, region: str = "wt-wt", timelimit: Optional[str] = None) -> Dict[str, Any]:
+    """Perform web search using DuckDuckGo Search (DDGS)."""
+    try:
+        from duckduckgo_search import DDGS
+    except Exception as e:
+        print(f"duckduckgo_search is not available: {e}")
+        return {}
+
+    results = []
+    try:
+        with DDGS() as ddgs:
+            for item in ddgs.text(query, region=region, timelimit=timelimit, max_results=max_results):
+                results.append(item)
+    except Exception as e:
+        print(f"Error occurred during DDGS search request: {e}")
+        return {}
+
+    normalized = {
+        "webPages": {
+            "value": [
+                {
+                    "name": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "siteName": "",
+                    "datePublished": "",
+                    "snippet": r.get("body", ""),
+                }
+                for r in results
+            ]
+        }
+    }
+    return normalized
+
+
+def google_web_search(query: str, api_key: str, cse_id: str, timeout: int = 20, num: int = 10) -> Dict[str, Any]:
+    """Perform web search using Google Custom Search JSON API."""
+    if not api_key or not cse_id:
+        print("Google search requires api_key and cse_id.")
+        return {}
+
+    endpoint = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "q": query,
+        "key": api_key,
+        "cx": cse_id,
+        "num": max(1, min(10, num)),
+    }
+    try:
+        response = requests.get(endpoint, params=params, timeout=timeout)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error occurred during Google Web Search request: {e}")
+        return {}
+
+    items = payload.get("items", [])
+    normalized = {
+        "webPages": {
+            "value": [
+                {
+                    "name": it.get("title", ""),
+                    "url": it.get("link", ""),
+                    "siteName": (it.get("displayLink", "") or ""),
+                    "datePublished": "",
+                    "snippet": it.get("snippet", ""),
+                }
+                for it in items
+            ]
+        }
+    }
+    return normalized
+
+
+def web_search(query: str, provider: str = "ddgs", subscription_key: Optional[str] = None, endpoint: Optional[str] = None,
+               market: str = "en-US", language: str = "en", timeout: int = 20, max_results: int = 10,
+               google_api_key: Optional[str] = None, google_cse_id: Optional[str] = None) -> Dict[str, Any]:
+    provider = (provider or "ddgs").lower()
+    if provider == "bing":
+        if not subscription_key:
+            print("Bing search requires subscription_key.")
+            return {}
+        return bing_web_search(query, subscription_key, endpoint or "https://api.bing.microsoft.com/v7.0/search", market=market, language=language, timeout=timeout)
+    if provider == "google":
+        return google_web_search(query, api_key=google_api_key or "", cse_id=google_cse_id or "", timeout=timeout, num=max_results)
+    return ddgs_web_search(query, max_results=max_results)
 def bing_web_search(query, subscription_key, endpoint, market='en-US', language='en', timeout=20):
     """
     Perform a search using the Bing Web Search API with a set timeout.
