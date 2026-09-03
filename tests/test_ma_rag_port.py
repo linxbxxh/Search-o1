@@ -69,3 +69,52 @@ def test_parse_queries_deduplicates():
         "[Query 1] alpha beta\n[Query 2] alpha beta\n[Query 3] gamma", limit=4
     )
     assert parsed == ["alpha beta", "gamma"]
+
+
+def test_official_entropy_order_is_high_to_low():
+    seen_second_round_prompt = {"text": ""}
+
+    def generate(prompt, n, round_id):
+        if round_id == 1:
+            return [
+                {"text": "low entropy\n<answer>A</answer>", "confidence": 0.10},
+                {"text": "high entropy\n<answer>B</answer>", "confidence": 0.90},
+                {"text": "mid entropy\n<answer>A</answer>", "confidence": 0.50},
+            ]
+        seen_second_round_prompt["text"] = prompt
+        return ["<answer>A</answer>"] * n
+
+    result = MARAGController(
+        generate,
+        lambda q, k: [],
+        query_generate_fn=lambda q, o, a: ["fact"],
+        num_workers=3,
+        num_rounds=2,
+        entropy_order_mode="official_code",
+    ).run("q")
+
+    assert result.rounds[0].ranked_candidate_indices == [1, 2, 0]
+    prompt = seen_second_round_prompt["text"]
+    assert prompt.index("high entropy") < prompt.index("mid entropy") < prompt.index("low entropy")
+
+
+def test_low_first_entropy_order_is_low_to_high():
+    def generate(prompt, n, round_id):
+        if round_id == 1:
+            return [
+                {"text": "low\n<answer>A</answer>", "confidence": 0.10},
+                {"text": "high\n<answer>B</answer>", "confidence": 0.90},
+                {"text": "mid\n<answer>A</answer>", "confidence": 0.50},
+            ]
+        return ["<answer>A</answer>"] * n
+
+    result = MARAGController(
+        generate,
+        lambda q, k: [],
+        query_generate_fn=lambda q, o, a: ["fact"],
+        num_workers=3,
+        num_rounds=2,
+        entropy_order_mode="low_first",
+    ).run("q")
+
+    assert result.rounds[0].ranked_candidate_indices == [0, 2, 1]
