@@ -6,7 +6,6 @@ It ports the core loop from NJU-RL/MA-RAG into a reusable controller:
   sample N candidates -> stop on consensus -> extract conflict queries -> retrieve
   -> rank previous answers -> next round with retrieved documents and history.
 
-The first port uses answer-level consensus and a configurable confidence callback.
 Stage-aligned conflict routing is deliberately NOT implemented here; it belongs in
 later ablations so this module can serve as the vanilla MA-RAG baseline.
 """
@@ -31,6 +30,8 @@ FINAL_CHOICE_RE = re.compile(r"(?:final\s+answer|answer)\s*[:：]?\s*\(?([A-Za-z
 class Candidate:
     text: str
     answer: str
+    # For the entropy variant this field stores mean token entropy, i.e. an
+    # uncertainty score: lower entropy means higher confidence.
     confidence: Optional[float] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -45,6 +46,8 @@ class RoundRecord:
     disagreement: float
     conflict_queries: List[str] = field(default_factory=list)
     retrieved_documents: List[Dict[str, Any]] = field(default_factory=list)
+    ranked_candidate_indices: List[int] = field(default_factory=list)
+    entropy_order_mode: str = "none"
 
 
 @dataclass
@@ -70,7 +73,7 @@ class MARAGController:
     ------------------
     generate_fn(prompt, n, round_id) -> list[str | dict]
         Generate independent solver answers. A dict may contain ``text``,
-        ``confidence`` and arbitrary metadata.
+        ``confidence`` (mean token entropy in the entropy variant), and metadata.
     retrieve_fn(query, top_k) -> list[dict]
         Retrieve evidence for one conflict-derived query.
 
@@ -81,9 +84,21 @@ class MARAGController:
         MA-RAG experiment, pass an LLM-backed implementation using
         ``build_conflict_query_prompt``.
     confidence_fn(text) -> float
-        Lower values should mean higher confidence when ``confidence_order`` is
-        ``low_first`` (matching MA-RAG entropy ranking).
+        Fallback uncertainty callback. Lower values should mean higher confidence.
+
+    Entropy order modes
+    -------------------
+    official_code
+        Match the released ``ma_rag_entropy.py`` implementation: previous answers
+        are ordered from HIGH mean token entropy to LOW mean token entropy.
+    low_first
+        Follow the semantic interpretation stated in the upstream prompt: lower
+        entropy = higher confidence, so previous answers are ordered LOW to HIGH.
+    none
+        Preserve candidate generation order.
     """
+
+    VALID_ENTROPY_ORDERS = {"official_code", "low_first", "none"}
 
     def __init__(
         self,
@@ -95,12 +110,14 @@ class MARAGController:
         num_rounds: int = 5,
         queries_per_conflict: int = 4,
         docs_per_query: int = 2,
-        confidence_order: str = "low_first",
+        entropy_order_mode: str = "official_code",
     ) -> None:
         if num_workers < 2:
             raise ValueError("num_workers must be >= 2 for conflict detection")
         if num_rounds < 1:
             raise ValueError("num_rounds must be >= 1")
+        if entropy_order_mode not in self.VALID_ENTROPY_ORDERS:
+            raise ValueError(f"entropy_order_mode must be one of {sorted(self.VALID_ENTROPY_ORDERS)}")
         self.generate_fn = generate_fn
         self.retrieve_fn = retrieve_fn
         self.query_generate_fn = query_generate_fn
@@ -109,7 +126,7 @@ class MARAGController:
         self.num_rounds = num_rounds
         self.queries_per_conflict = queries_per_conflict
         self.docs_per_query = docs_per_query
-        self.confidence_order = confidence_order
+        self.entropy_order_mode = entropy_order_mode
 
     @staticmethod
     def extract_answer(text: str) -> str:
@@ -233,17 +250,28 @@ class MARAGController:
             confidence = float(self.confidence_fn(text))
         return Candidate(text=text, answer=self.extract_answer(text), confidence=confidence, metadata=metadata)
 
-    def _rank_answers(self, candidates: Sequence[Candidate]) -> List[str]:
-        # MA-RAG entropy version feeds previous answers ordered by entropy/confidence.
-        if not any(c.confidence is not None for c in candidates):
-            return [c.text for c in candidates]
-        reverse = self.confidence_order == "high_first"
-        ranked = sorted(
-            candidates,
-            key=lambda c: math.inf if c.confidence is None else c.confidence,
-            reverse=reverse,
+    def _rank_candidates(self, candidates: Sequence[Candidate]) -> List[Tuple[int, Candidate]]:
+        indexed = list(enumerate(candidates))
+        if self.entropy_order_mode == "none" or not any(c.confidence is not None for c in candidates):
+            return indexed
+
+        if self.entropy_order_mode == "official_code":
+            # Released MA-RAG code uses np.argsort(entropies)[::-1]: high -> low.
+            return sorted(
+                indexed,
+                key=lambda x: -math.inf if x[1].confidence is None else x[1].confidence,
+                reverse=True,
+            )
+
+        # Prompt semantics: low entropy = high confidence.
+        return sorted(
+            indexed,
+            key=lambda x: math.inf if x[1].confidence is None else x[1].confidence,
         )
-        return [c.text for c in ranked]
+
+    def _rank_answers(self, candidates: Sequence[Candidate]) -> Tuple[List[str], List[int]]:
+        ranked = self._rank_candidates(candidates)
+        return [c.text for _, c in ranked], [idx for idx, _ in ranked]
 
     def _fallback_queries(self, question: str, candidates: Sequence[Candidate]) -> List[str]:
         answers = [c.answer for c in candidates if c.answer]
@@ -298,6 +326,7 @@ class MARAGController:
                 consensus=converged,
                 consensus_answer=consensus_answer,
                 disagreement=self.disagreement(predictions),
+                entropy_order_mode=self.entropy_order_mode,
             )
             rounds.append(record)
             last_candidates = candidates
@@ -313,7 +342,7 @@ class MARAGController:
             documents = self._retrieve(queries)
             record.conflict_queries = queries
             record.retrieved_documents = documents
-            previous_answers = self._rank_answers(candidates)
+            previous_answers, record.ranked_candidate_indices = self._rank_answers(candidates)
 
         valid_answers = [c.answer for c in last_candidates if c.answer]
         majority = Counter(valid_answers).most_common(1)[0][0] if valid_answers else ""
